@@ -388,6 +388,7 @@ mod tests {
     struct MemStoreInner {
         pages: Mutex<std::collections::HashMap<Cid, Vec<u8>>>,
         root: Mutex<Option<Cid>>,
+        named_roots: Mutex<std::collections::HashMap<String, Cid>>,
     }
 
     impl MemStore {
@@ -396,6 +397,7 @@ mod tests {
                 inner: Arc::new(MemStoreInner {
                     pages: Mutex::new(std::collections::HashMap::new()),
                     root: Mutex::new(None),
+                    named_roots: Mutex::new(std::collections::HashMap::new()),
                 }),
             }
         }
@@ -426,6 +428,26 @@ mod tests {
 
         fn current_root(&self) -> CsResult<Option<Cid>> {
             Ok(*self.inner.root.lock().unwrap())
+        }
+
+        fn set_named_root(&self, name: &str, cid: Cid) -> CsResult<()> {
+            self.inner.named_roots.lock().unwrap().insert(name.to_string(), cid);
+            Ok(())
+        }
+
+        fn get_named_root(&self, name: &str) -> CsResult<Option<Cid>> {
+            Ok(self.inner.named_roots.lock().unwrap().get(name).copied())
+        }
+
+        fn remove_named_root(&self, name: &str) -> CsResult<bool> {
+            Ok(self.inner.named_roots.lock().unwrap().remove(name).is_some())
+        }
+
+        fn list_named_roots(&self) -> CsResult<Vec<(String, Cid)>> {
+            let roots = self.inner.named_roots.lock().unwrap();
+            let mut v: Vec<_> = roots.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(v)
         }
     }
 
@@ -650,5 +672,165 @@ mod tests {
 
         // Content-addressed dedup means identical pages stored once
         assert!(store.page_count() > 0);
+    }
+
+    // --- Snapshot & Branch tests ---
+
+    #[test]
+    fn test_snapshot_and_restore() {
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        // Create table, insert initial data
+        {
+            let db = open_db(&name);
+            db.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        }
+
+        // Take snapshot
+        let snap_cid = store.current_root().unwrap().unwrap();
+        store.set_named_root("v1", snap_cid).unwrap();
+
+        // Modify data
+        {
+            let db = open_db(&name);
+            db.execute("INSERT INTO t VALUES (2)", []).unwrap();
+            db.execute("INSERT INTO t VALUES (3)", []).unwrap();
+        }
+
+        // Verify current state has 3 rows
+        {
+            let db = open_db(&name);
+            let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+            assert_eq!(count, 3);
+        }
+
+        // Restore snapshot v1
+        let v1_cid = store.get_named_root("v1").unwrap().unwrap();
+        store.update_root(v1_cid).unwrap();
+
+        // Verify restored state has only 1 row
+        {
+            let db = open_db(&name);
+            let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn test_branch_diverge() {
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        // Create base state
+        {
+            let db = open_db(&name);
+            db.execute_batch("
+                CREATE TABLE t (x INTEGER);
+                INSERT INTO t VALUES (100);
+            ").unwrap();
+        }
+        let base = store.current_root().unwrap().unwrap();
+        store.set_named_root("main", base).unwrap();
+        store.set_named_root("feature", base).unwrap();
+
+        // Diverge on "main": add row 200
+        store.update_root(store.get_named_root("main").unwrap().unwrap()).unwrap();
+        {
+            let db = open_db(&name);
+            db.execute("INSERT INTO t VALUES (200)", []).unwrap();
+        }
+        store.set_named_root("main", store.current_root().unwrap().unwrap()).unwrap();
+
+        // Diverge on "feature": add row 300
+        store.update_root(store.get_named_root("feature").unwrap().unwrap()).unwrap();
+        {
+            let db = open_db(&name);
+            db.execute("INSERT INTO t VALUES (300)", []).unwrap();
+        }
+        store.set_named_root("feature", store.current_root().unwrap().unwrap()).unwrap();
+
+        // Verify "main" has {100, 200}
+        store.update_root(store.get_named_root("main").unwrap().unwrap()).unwrap();
+        {
+            let db = open_db(&name);
+            let sum: i64 = db.query_row("SELECT SUM(x) FROM t", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+            assert_eq!(sum, 300); // 100 + 200
+        }
+
+        // Verify "feature" has {100, 300}
+        store.update_root(store.get_named_root("feature").unwrap().unwrap()).unwrap();
+        {
+            let db = open_db(&name);
+            let sum: i64 = db.query_row("SELECT SUM(x) FROM t", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+            assert_eq!(sum, 400); // 100 + 300
+        }
+    }
+
+    #[test]
+    fn test_snapshot_list_and_remove() {
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        {
+            let db = open_db(&name);
+            db.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        }
+
+        let root = store.current_root().unwrap().unwrap();
+        store.set_named_root("alpha", root).unwrap();
+        store.set_named_root("beta", root).unwrap();
+        store.set_named_root("gamma", root).unwrap();
+
+        let roots = store.list_named_roots().unwrap();
+        assert_eq!(roots.len(), 3);
+        assert_eq!(roots[0].0, "alpha");
+        assert_eq!(roots[1].0, "beta");
+        assert_eq!(roots[2].0, "gamma");
+
+        // Remove one
+        assert!(store.remove_named_root("beta").unwrap());
+        assert!(!store.remove_named_root("beta").unwrap());
+        assert_eq!(store.list_named_roots().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_page_table_diff_via_snapshots() {
+        use craftsql_core::PageTable;
+
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        // Create initial state
+        {
+            let db = open_db(&name);
+            db.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        }
+        let root_v1 = store.current_root().unwrap().unwrap();
+        store.set_named_root("v1", root_v1).unwrap();
+
+        // Modify
+        {
+            let db = open_db(&name);
+            db.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        }
+        let root_v2 = store.current_root().unwrap().unwrap();
+
+        // Load both page tables and diff
+        let pt1_data = store.get(&root_v1).unwrap();
+        let pt1 = PageTable::from_bytes(&pt1_data.data).unwrap();
+
+        let pt2_data = store.get(&root_v2).unwrap();
+        let pt2 = PageTable::from_bytes(&pt2_data.data).unwrap();
+
+        let diff = pt2.diff(&pt1);
+        // At least one page should have changed (the data page with the new row)
+        assert!(!diff.changed.is_empty());
     }
 }

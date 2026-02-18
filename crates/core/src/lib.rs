@@ -55,11 +55,49 @@ pub trait PageStore: Send + Sync {
     /// Store a page, returns its content identifier
     fn put(&self, page: &Page) -> Result<Cid>;
 
-    /// Update the root pointer to a new page table CID
+    /// Update the default root pointer to a new page table CID
     fn update_root(&self, new_root: Cid) -> Result<()>;
 
-    /// Get the current root pointer
+    /// Get the current default root pointer
     fn current_root(&self) -> Result<Option<Cid>>;
+
+    /// Save a named root pointer (snapshot/branch)
+    fn set_named_root(&self, name: &str, cid: Cid) -> Result<()>;
+
+    /// Get a named root pointer
+    fn get_named_root(&self, name: &str) -> Result<Option<Cid>>;
+
+    /// Remove a named root pointer
+    fn remove_named_root(&self, name: &str) -> Result<bool>;
+
+    /// List all named root pointers
+    fn list_named_roots(&self) -> Result<Vec<(String, Cid)>>;
+}
+
+/// Diff between two PageTables — which pages changed
+#[derive(Debug, Clone)]
+pub struct PageTableDiff {
+    /// Pages added or modified: (page_num, old_cid, new_cid)
+    pub changed: Vec<(usize, Option<Cid>, Option<Cid>)>,
+}
+
+impl PageTable {
+    /// Compute diff from `old` to `self` (new).
+    /// Returns entries where CIDs differ.
+    pub fn diff(&self, old: &PageTable) -> PageTableDiff {
+        let max_len = self.entries.len().max(old.entries.len());
+        let mut changed = Vec::new();
+
+        for i in 0..max_len {
+            let old_cid = old.get(i).copied();
+            let new_cid = self.get(i).copied();
+            if old_cid != new_cid {
+                changed.push((i, old_cid, new_cid));
+            }
+        }
+
+        PageTableDiff { changed }
+    }
 }
 
 /// Page table — maps page numbers to CIDs
@@ -139,6 +177,34 @@ mod tests {
         assert_eq!(pt.get(5), Some(&cid));
         assert_eq!(pt.get(1), None);
         assert_eq!(pt.get(100), None);
+    }
+
+    #[test]
+    fn test_page_table_diff() {
+        let mut old = PageTable::new();
+        old.set(0, Cid::from_bytes(b"page A"));
+        old.set(1, Cid::from_bytes(b"page B"));
+        old.set(2, Cid::from_bytes(b"page C"));
+
+        let mut new = PageTable::new();
+        new.set(0, Cid::from_bytes(b"page A")); // unchanged
+        new.set(1, Cid::from_bytes(b"page B modified")); // changed
+        new.set(2, Cid::from_bytes(b"page C")); // unchanged
+        new.set(3, Cid::from_bytes(b"page D")); // added
+
+        let diff = new.diff(&old);
+        assert_eq!(diff.changed.len(), 2); // page 1 changed, page 3 added
+        assert_eq!(diff.changed[0].0, 1); // page 1
+        assert_eq!(diff.changed[1].0, 3); // page 3
+        assert!(diff.changed[1].1.is_none()); // was absent
+        assert!(diff.changed[1].2.is_some()); // now present
+    }
+
+    #[test]
+    fn test_page_table_diff_empty() {
+        let a = PageTable::new();
+        let b = PageTable::new();
+        assert_eq!(a.diff(&b).changed.len(), 0);
     }
 
     #[test]
