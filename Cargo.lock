@@ -88,6 +88,7 @@ name = "craftsql-vfs"
 version = "0.1.0"
 dependencies = [
  "craftsql-core",
+ "craftsql-store-local",
  "log",
  "rusqlite",
  "sqlite-vfs",

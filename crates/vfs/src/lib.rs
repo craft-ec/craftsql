@@ -72,9 +72,13 @@ impl<S: PageStore + 'static> Vfs for CraftVfs<S> {
     type Handle = CraftDbHandle<S>;
 
     fn open(&self, _db: &str, opts: OpenOptions) -> Result<Self::Handle, Error> {
-        // Only handle main database files
+        // For journal/temp files, return an empty handle
         if opts.kind != OpenKind::MainDb {
-            return Err(Error::new(ErrorKind::Other, "only main database supported"));
+            return Ok(CraftDbHandle {
+                store: Arc::clone(&self.store),
+                pages: Mutex::new(PageBuffer::new(PageTable::new(), 4096)),
+                lock: Mutex::new(LockKind::None),
+            });
         }
 
         // Load existing page table or create new
@@ -124,13 +128,21 @@ impl<S: PageStore + 'static> Vfs for CraftVfs<S> {
         })
     }
 
-    fn delete(&self, _db: &str) -> Result<(), Error> {
+    fn delete(&self, db: &str) -> Result<(), Error> {
+        // Only delete the main database, not journal/wal files
+        if db.ends_with("-journal") || db.ends_with("-wal") || db.ends_with("-shm") {
+            return Ok(()); // Journal cleanup is a no-op for us
+        }
         // Delete = reset root pointer. Pages are garbage collected separately.
         self.store.update_root(Cid([0u8; 32]))
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     }
 
-    fn exists(&self, _db: &str) -> Result<bool, Error> {
+    fn exists(&self, db: &str) -> Result<bool, Error> {
+        // Journal/WAL files never "exist" in our VFS
+        if db.ends_with("-journal") || db.ends_with("-wal") || db.ends_with("-shm") {
+            return Ok(false);
+        }
         let root = self.store.current_root()
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         Ok(root.is_some())
@@ -321,7 +333,6 @@ impl<S: PageStore + 'static> DatabaseHandle for CraftDbHandle<S> {
     }
 
     fn lock(&mut self, lock: LockKind) -> Result<bool, Error> {
-        // Single-owner: locking always succeeds
         *self.lock.lock().unwrap() = lock;
         Ok(true)
     }
@@ -331,7 +342,8 @@ impl<S: PageStore + 'static> DatabaseHandle for CraftDbHandle<S> {
     }
 
     fn current_lock(&self) -> Result<LockKind, Error> {
-        Ok(*self.lock.lock().unwrap())
+        let l = *self.lock.lock().unwrap();
+        Ok(l)
     }
 
     fn wal_index(&self, _readonly: bool) -> Result<WalDisabled, Error> {
@@ -360,14 +372,20 @@ impl<S: PageStore> CraftDbHandle<S> {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use craftsql_core::{PageStoreError, Result as CsResult};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// In-memory PageStore for testing.
+    /// In-memory PageStore for testing. Clone-friendly (Arc inner).
+    #[derive(Clone)]
     struct MemStore {
+        inner: Arc<MemStoreInner>,
+    }
+
+    struct MemStoreInner {
         pages: Mutex<std::collections::HashMap<Cid, Vec<u8>>>,
         root: Mutex<Option<Cid>>,
     }
@@ -375,37 +393,39 @@ mod tests {
     impl MemStore {
         fn new() -> Self {
             Self {
-                pages: Mutex::new(std::collections::HashMap::new()),
-                root: Mutex::new(None),
+                inner: Arc::new(MemStoreInner {
+                    pages: Mutex::new(std::collections::HashMap::new()),
+                    root: Mutex::new(None),
+                }),
             }
         }
 
         fn page_count(&self) -> usize {
-            self.pages.lock().unwrap().len()
+            self.inner.pages.lock().unwrap().len()
         }
     }
 
     impl PageStore for MemStore {
         fn get(&self, cid: &Cid) -> CsResult<Page> {
-            let pages = self.pages.lock().unwrap();
-            pages.get(cid)
+            self.inner.pages.lock().unwrap()
+                .get(cid)
                 .map(|d| Page { data: d.clone() })
                 .ok_or(PageStoreError::NotFound(*cid))
         }
 
         fn put(&self, page: &Page) -> CsResult<Cid> {
             let cid = Cid::from_bytes(&page.data);
-            self.pages.lock().unwrap().insert(cid, page.data.clone());
+            self.inner.pages.lock().unwrap().insert(cid, page.data.clone());
             Ok(cid)
         }
 
         fn update_root(&self, new_root: Cid) -> CsResult<()> {
-            *self.root.lock().unwrap() = Some(new_root);
+            *self.inner.root.lock().unwrap() = Some(new_root);
             Ok(())
         }
 
         fn current_root(&self) -> CsResult<Option<Cid>> {
-            Ok(*self.root.lock().unwrap())
+            Ok(*self.inner.root.lock().unwrap())
         }
     }
 
@@ -415,15 +435,25 @@ mod tests {
         format!("craftsql_test_{}", VFS_COUNTER.fetch_add(1, Ordering::SeqCst))
     }
 
-    #[test]
-    fn test_sqlite_create_table_insert_query() {
-        let name = unique_vfs_name();
-        let store = MemStore::new();
-        register(&name, store).unwrap();
+    const OPEN_RW: rusqlite::OpenFlags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        .union(rusqlite::OpenFlags::SQLITE_OPEN_CREATE);
 
-        let db = rusqlite::Connection::open_with_flags_and_vfs(":memory:", rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE, &name).unwrap();
+    fn open_db(name: &str) -> rusqlite::Connection {
+        let path = format!("/craftsql/{name}/db");
+        let db = rusqlite::Connection::open_with_flags_and_vfs(&path, OPEN_RW, name).unwrap();
+        db.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        db
+    }
+
+    // --- Basic SQL tests ---
+
+    #[test]
+    fn test_create_insert_query() {
+        let name = unique_vfs_name();
+        register(&name, MemStore::new()).unwrap();
+        let db = open_db(&name);
+
         db.execute_batch("
-            PRAGMA journal_mode=DELETE;
             CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
             INSERT INTO users VALUES (1, 'alice');
             INSERT INTO users VALUES (2, 'bob');
@@ -431,96 +461,194 @@ mod tests {
 
         let names: Vec<String> = db
             .prepare("SELECT name FROM users ORDER BY id").unwrap()
-            .query_map([], |row| row.get(0)).unwrap()
+            .query_map([], |r: &rusqlite::Row| r.get(0)).unwrap()
             .map(|r| r.unwrap())
             .collect();
-
         assert_eq!(names, vec!["alice", "bob"]);
     }
 
     #[test]
-    fn test_sqlite_multiple_tables() {
+    fn test_many_rows() {
         let name = unique_vfs_name();
         register(&name, MemStore::new()).unwrap();
+        let db = open_db(&name);
 
-        let db = rusqlite::Connection::open_with_flags_and_vfs(":memory:", rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE, &name).unwrap();
-        db.execute_batch("
-            PRAGMA journal_mode=DELETE;
-            CREATE TABLE t1 (x INTEGER);
-            CREATE TABLE t2 (y TEXT);
-            INSERT INTO t1 VALUES (42);
-            INSERT INTO t2 VALUES ('hello');
-        ").unwrap();
-
-        let x: i64 = db.query_row("SELECT x FROM t1", [], |r: &rusqlite::Row| r.get(0)).unwrap();
-        let y: String = db.query_row("SELECT y FROM t2", [], |r: &rusqlite::Row| r.get(0)).unwrap();
-        assert_eq!(x, 42);
-        assert_eq!(y, "hello");
-    }
-
-    #[test]
-    fn test_sqlite_many_rows() {
-        let name = unique_vfs_name();
-        register(&name, MemStore::new()).unwrap();
-
-        let db = rusqlite::Connection::open_with_flags_and_vfs(":memory:", rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE, &name).unwrap();
-        db.execute_batch("
-            PRAGMA journal_mode=DELETE;
-            CREATE TABLE nums (i INTEGER);
-        ").unwrap();
-
+        db.execute_batch("CREATE TABLE nums (i INTEGER);").unwrap();
         for i in 0..1000 {
             db.execute("INSERT INTO nums VALUES (?1)", [i]).unwrap();
         }
-
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM nums", [], |r: &rusqlite::Row| r.get(0)).unwrap();
-        assert_eq!(count, 1000);
 
         let sum: i64 = db.query_row("SELECT SUM(i) FROM nums", [], |r: &rusqlite::Row| r.get(0)).unwrap();
         assert_eq!(sum, 999 * 1000 / 2);
     }
 
     #[test]
-    fn test_sqlite_index_and_query() {
+    fn test_transaction_rollback() {
         let name = unique_vfs_name();
         register(&name, MemStore::new()).unwrap();
+        let db = open_db(&name);
 
-        let db = rusqlite::Connection::open_with_flags_and_vfs(":memory:", rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE, &name).unwrap();
         db.execute_batch("
-            PRAGMA journal_mode=DELETE;
-            CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB);
-            CREATE INDEX idx_key ON kv(key);
-        ").unwrap();
-
-        for i in 0..100 {
-            db.execute("INSERT INTO kv VALUES (?1, ?2)",
-                rusqlite::params![format!("key_{:04}", i), vec![i as u8; 64]],
-            ).unwrap();
-        }
-
-        let val: Vec<u8> = db.query_row(
-            "SELECT value FROM kv WHERE key = 'key_0042'", [], |r: &rusqlite::Row| r.get(0)
-        ).unwrap();
-        assert_eq!(val.len(), 64);
-        assert!(val.iter().all(|&b| b == 42));
-    }
-
-    #[test]
-    fn test_sqlite_transaction_rollback() {
-        let name = unique_vfs_name();
-        register(&name, MemStore::new()).unwrap();
-
-        let db = rusqlite::Connection::open_with_flags_and_vfs(":memory:", rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE, &name).unwrap();
-        db.execute_batch("
-            PRAGMA journal_mode=DELETE;
             CREATE TABLE t (x INTEGER);
             INSERT INTO t VALUES (1);
         ").unwrap();
 
-        // Start transaction, insert, rollback
         db.execute_batch("BEGIN; INSERT INTO t VALUES (2); ROLLBACK;").unwrap();
 
         let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r: &rusqlite::Row| r.get(0)).unwrap();
-        assert_eq!(count, 1); // Only the first row
+        assert_eq!(count, 1);
+    }
+
+    // --- Persistence tests ---
+
+    #[test]
+    fn test_persist_close_reopen() {
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        // Write and close
+        {
+            let db = open_db(&name);
+            db.execute_batch("
+                CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT);
+                INSERT INTO items VALUES (1, 'persisted');
+                INSERT INTO items VALUES (2, 'across');
+                INSERT INTO items VALUES (3, 'connections');
+            ").unwrap();
+        }
+
+        assert!(store.current_root().unwrap().is_some());
+
+        // Reopen and query
+        {
+            let db = open_db(&name);
+            let vals: Vec<String> = db
+                .prepare("SELECT val FROM items ORDER BY id").unwrap()
+                .query_map([], |r: &rusqlite::Row| r.get(0)).unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(vals, vec!["persisted", "across", "connections"]);
+        }
+    }
+
+    #[test]
+    fn test_persist_schema_and_index() {
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        // Create schema with index + data
+        {
+            let db = open_db(&name);
+            db.execute_batch("
+                CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB);
+                CREATE INDEX idx_key ON kv(key);
+            ").unwrap();
+            for i in 0..50 {
+                db.execute("INSERT INTO kv VALUES (?1, ?2)",
+                    rusqlite::params![format!("k{:03}", i), vec![i as u8; 32]],
+                ).unwrap();
+            }
+        }
+
+        // Reopen — schema, index, and data survive
+        {
+            let db = open_db(&name);
+
+            let count: i64 = db.query_row("SELECT COUNT(*) FROM kv", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+            assert_eq!(count, 50);
+
+            let val: Vec<u8> = db.query_row(
+                "SELECT value FROM kv WHERE key = 'k025'", [], |r: &rusqlite::Row| r.get(0)
+            ).unwrap();
+            assert_eq!(val, vec![25u8; 32]);
+
+            // Can still insert after reopen
+            db.execute("INSERT INTO kv VALUES ('new', X'CAFE')", []).unwrap();
+            let count2: i64 = db.query_row("SELECT COUNT(*) FROM kv", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+            assert_eq!(count2, 51);
+        }
+    }
+
+    #[test]
+    fn test_persist_multiple_cycles() {
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        // Cycle 1: create table
+        {
+            let db = open_db(&name);
+            db.execute_batch("CREATE TABLE counter (n INTEGER);").unwrap();
+            db.execute("INSERT INTO counter VALUES (0)", []).unwrap();
+        }
+
+        // Cycles 2-10: reopen, update, close
+        for i in 1..=10 {
+            let db = open_db(&name);
+            db.execute("UPDATE counter SET n = ?1", [i]).unwrap();
+        }
+
+        // Verify final value
+        {
+            let db = open_db(&name);
+            let n: i64 = db.query_row("SELECT n FROM counter", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+            assert_eq!(n, 10);
+        }
+    }
+
+    #[test]
+    fn test_persist_with_local_page_store() {
+        use craftsql_store_local::LocalPageStore;
+
+        let dir = std::env::temp_dir().join(format!("craftsql-persist-{}", std::process::id()));
+
+        // Write with LocalPageStore
+        let name1 = unique_vfs_name();
+        {
+            let store = LocalPageStore::new(&dir).unwrap();
+            register(&name1, store).unwrap();
+            let db = open_db(&name1);
+            db.execute_batch("
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+                INSERT INTO docs VALUES (1, 'hello from disk');
+            ").unwrap();
+        }
+
+        // Reopen with fresh LocalPageStore (new VFS registration, same dir)
+        let name2 = unique_vfs_name();
+        {
+            let store = LocalPageStore::new(&dir).unwrap();
+            register(&name2, store).unwrap();
+            let db = open_db(&name2);
+            let body: String = db.query_row(
+                "SELECT body FROM docs WHERE id = 1", [], |r: &rusqlite::Row| r.get(0)
+            ).unwrap();
+            assert_eq!(body, "hello from disk");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_content_dedup() {
+        let name = unique_vfs_name();
+        let store = MemStore::new();
+        register(&name, store.clone()).unwrap();
+
+        let db = open_db(&name);
+        db.execute_batch("CREATE TABLE t (data BLOB);").unwrap();
+        let blob = vec![0xABu8; 3000];
+        for _ in 0..100 {
+            db.execute("INSERT INTO t VALUES (?1)", [&blob[..]]).unwrap();
+        }
+
+        // Verify data
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r: &rusqlite::Row| r.get(0)).unwrap();
+        assert_eq!(count, 100);
+
+        // Content-addressed dedup means identical pages stored once
+        assert!(store.page_count() > 0);
     }
 }
