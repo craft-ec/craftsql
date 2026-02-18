@@ -1,0 +1,13 @@
+[package]
+name = "craftsql-vfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+craftsql-core = { path = "../core" }
+sqlite-vfs = "0.2"
+log = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.35", features = ["bundled"] }
