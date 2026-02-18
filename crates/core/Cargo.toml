@@ -1,0 +1,11 @@
+[package]
+name = "craftsql-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4.3"
+thiserror = "2.0.18"
+bincode = "1"
