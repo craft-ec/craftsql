@@ -1,0 +1,18 @@
+[package]
+name = "craftsql-objbridge"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+craftsql-core = { path = "../core" }
+craftsql-objstore = { path = "../objstore" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tempfile = "3"
+
+[dev-dependencies]
+craftsql-vfs = { path = "../vfs" }
+rusqlite = { version = "0.35", features = ["bundled"] }
+tempfile = "3"
