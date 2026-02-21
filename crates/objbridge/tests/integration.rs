@@ -102,6 +102,38 @@ impl MockDaemon {
                                 None => Err(format!("content not found: {}", cid_hex)),
                             }
                         }
+                        "kv.put" => {
+                            let key = params.and_then(|p| p.get("key")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let value = params.and_then(|p| p.get("value")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            store.lock().unwrap().insert(format!("__kv__{}", key), value.into_bytes());
+                            Ok(serde_json::json!({"ok": true}))
+                        }
+                        "kv.get" => {
+                            let key = params.and_then(|p| p.get("key")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let s = store.lock().unwrap();
+                            match s.get(&format!("__kv__{}", key)) {
+                                Some(data) => {
+                                    let val = String::from_utf8_lossy(data).to_string();
+                                    Ok(serde_json::json!({"key": key, "value": val}))
+                                }
+                                None => Ok(serde_json::json!({"key": key, "value": null})),
+                            }
+                        }
+                        "kv.delete" => {
+                            let key = params.and_then(|p| p.get("key")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let existed = store.lock().unwrap().remove(&format!("__kv__{}", key)).is_some();
+                            Ok(serde_json::json!({"deleted": existed}))
+                        }
+                        "kv.list" => {
+                            let prefix = params.and_then(|p| p.get("prefix")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let s = store.lock().unwrap();
+                            let keys: Vec<String> = s.keys()
+                                .filter(|k| k.starts_with("__kv__"))
+                                .map(|k| k.strip_prefix("__kv__").unwrap().to_string())
+                                .filter(|k| k.starts_with(&prefix))
+                                .collect();
+                            Ok(serde_json::json!({"keys": keys}))
+                        }
                         _ => Err(format!("unknown method: {}", method)),
                     };
 
@@ -158,7 +190,7 @@ fn test_publish_and_fetch_via_mock_daemon() {
 
 #[test]
 fn test_page_store_with_mock_daemon() {
-    use craftsql_core::{Page, PageStore};
+    use craftsql_core::{Page, PageStore, PageTable};
     use craftsql_objbridge::DaemonBackend;
     use craftsql_objstore::CraftObjPageStore;
 
@@ -171,18 +203,26 @@ fn test_page_store_with_mock_daemon() {
     let tmp = tempfile::tempdir().unwrap();
     let store = CraftObjPageStore::new(tmp.path(), backend).unwrap();
 
-    // Put a page
-    let page = Page { data: b"page data for store test".to_vec() };
+    // Put a page (locally cached only)
+    let page = Page { data: vec![0xAB; 4096] };
     let cid = store.put(&page).unwrap();
 
-    // Get it back (should be cache hit, no daemon call)
+    // Get it back (should be cache hit)
     let got = store.get(&cid).unwrap();
     assert_eq!(got.data, page.data);
 
-    // Root management (local only)
+    // Root management — build a proper page table for update_root
     assert_eq!(store.current_root().unwrap(), None);
-    store.update_root(cid).unwrap();
-    assert_eq!(store.current_root().unwrap(), Some(cid));
+    let mut pt = PageTable::new();
+    pt.set(0, cid);
+    let pt_data = pt.to_bytes();
+    let pt_cid = Cid::from_bytes(&pt_data);
+    store.put(&Page { data: pt_data }).unwrap();
+    store.update_root(pt_cid).unwrap();
+
+    // Root is now the bundle CID (not page table CID)
+    let root = store.current_root().unwrap();
+    assert!(root.is_some());
 }
 
 #[test]

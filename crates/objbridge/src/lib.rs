@@ -174,31 +174,68 @@ impl NetworkBackend for DaemonBackend {
     }
 
     fn get_root(&self) -> Result<Option<Cid>> {
-        // Root pointers are craftsql-specific — not stored in CraftOBJ.
-        // CraftObjPageStore manages roots locally via disk cache.
-        // Return None to let the local cache be authoritative.
-        Ok(None)
+        self.get_named_root("__default__")
     }
 
-    fn set_root(&self, _cid: Cid) -> Result<()> {
-        // Root management is local-only for now.
+    fn set_root(&self, cid: Cid) -> Result<()> {
+        self.set_named_root("__default__", cid)
+    }
+
+    fn get_named_root(&self, name: &str) -> Result<Option<Cid>> {
+        let key = format!("craftsql:root:{}", name);
+        let result = self.rpc_call("kv.get", Some(serde_json::json!({"key": key})))?;
+        match result.get("value").and_then(|v| v.as_str()) {
+            Some(hex_str) => {
+                let bytes = hex::decode(hex_str)
+                    .map_err(|e| PageStoreError::Storage(format!("invalid root hex: {}", e)))?;
+                if bytes.len() != 32 {
+                    return Err(PageStoreError::Storage("invalid root CID length".into()));
+                }
+                let mut cid = [0u8; 32];
+                cid.copy_from_slice(&bytes);
+                Ok(Some(Cid(cid)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn set_named_root(&self, name: &str, cid: Cid) -> Result<()> {
+        let key = format!("craftsql:root:{}", name);
+        self.rpc_call("kv.put", Some(serde_json::json!({
+            "key": key,
+            "value": hex::encode(cid.0),
+        })))?;
         Ok(())
     }
 
-    fn get_named_root(&self, _name: &str) -> Result<Option<Cid>> {
-        Ok(None)
-    }
-
-    fn set_named_root(&self, _name: &str, _cid: Cid) -> Result<()> {
-        Ok(())
-    }
-
-    fn remove_named_root(&self, _name: &str) -> Result<bool> {
-        Ok(false)
+    fn remove_named_root(&self, name: &str) -> Result<bool> {
+        let key = format!("craftsql:root:{}", name);
+        let result = self.rpc_call("kv.delete", Some(serde_json::json!({"key": key})))?;
+        Ok(result.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
     fn list_named_roots(&self) -> Result<Vec<(String, Cid)>> {
-        Ok(Vec::new())
+        let result = self.rpc_call("kv.list", Some(serde_json::json!({
+            "prefix": "craftsql:root:",
+        })))?;
+        let keys = result.get("keys")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut roots = Vec::new();
+        let prefix = "craftsql:root:";
+        for key_val in keys {
+            if let Some(key) = key_val.as_str() {
+                let name = key.strip_prefix(prefix).unwrap_or(key);
+                if name == "__default__" { continue; }
+                if let Ok(Some(cid)) = self.get_named_root(name) {
+                    roots.push((name.to_string(), cid));
+                }
+            }
+        }
+        roots.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(roots)
     }
 }
 
@@ -241,14 +278,15 @@ mod tests {
     }
 
     #[test]
-    fn test_root_operations_are_noop() {
-        let backend = DaemonBackend::new("/tmp/nonexistent.sock");
-        // These should succeed without connecting to daemon
-        assert_eq!(backend.get_root().unwrap(), None);
-        backend.set_root(Cid([0; 32])).unwrap();
-        assert_eq!(backend.get_named_root("test").unwrap(), None);
-        backend.set_named_root("test", Cid([0; 32])).unwrap();
-        assert!(!backend.remove_named_root("test").unwrap());
-        assert!(backend.list_named_roots().unwrap().is_empty());
+    fn test_root_operations_require_daemon() {
+        let backend = DaemonBackend::new("/tmp/nonexistent-craftsql-test-root.sock");
+        // Root operations now go through kv.put/kv.get RPC, so they fail
+        // when daemon is not running
+        assert!(backend.get_root().is_err());
+        assert!(backend.set_root(Cid([0; 32])).is_err());
+        assert!(backend.get_named_root("test").is_err());
+        assert!(backend.set_named_root("test", Cid([0; 32])).is_err());
+        assert!(backend.remove_named_root("test").is_err());
+        assert!(backend.list_named_roots().is_err());
     }
 }
